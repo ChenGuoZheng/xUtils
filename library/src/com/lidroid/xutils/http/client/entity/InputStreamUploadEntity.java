@@ -15,12 +15,13 @@
 
 package com.lidroid.xutils.http.client.entity;
 
-import com.lidroid.xutils.http.client.callback.RequestCallBackHandler;
+import com.lidroid.xutils.http.callback.RequestCallBackHandler;
 import com.lidroid.xutils.util.IOUtils;
 import org.apache.http.entity.AbstractHttpEntity;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 
 /**
@@ -74,7 +75,7 @@ public class InputStreamUploadEntity extends AbstractHttpEntity implements Uploa
                     uploadedSize += l;
                     if (callBackHandler != null) {
                         if (!callBackHandler.updateProgress(uploadedSize + 1, uploadedSize, false)) {
-                            break;
+                            throw new InterruptedIOException("cancel");
                         }
                     }
                 }
@@ -91,7 +92,7 @@ public class InputStreamUploadEntity extends AbstractHttpEntity implements Uploa
                     uploadedSize += l;
                     if (callBackHandler != null) {
                         if (!callBackHandler.updateProgress(length, uploadedSize, false)) {
-                            break;
+                            throw new InterruptedIOException("cancel");
                         }
                     }
                 }

@@ -40,11 +40,11 @@ public class SqlInfoBuilder {
         StringBuffer sqlBuffer = new StringBuffer();
 
         sqlBuffer.append("INSERT INTO ");
-        sqlBuffer.append(Table.get(entity.getClass()).getTableName());
+        sqlBuffer.append(TableUtils.getTableName(entity.getClass()));
         sqlBuffer.append(" (");
         for (KeyValue kv : keyValueList) {
-            sqlBuffer.append(kv.getKey()).append(",");
-            result.addBindArg(kv.getValue());
+            sqlBuffer.append(kv.key).append(",");
+            result.addBindArgWithoutConverter(kv.value);
         }
         sqlBuffer.deleteCharAt(sqlBuffer.length() - 1);
         sqlBuffer.append(") VALUES (");
@@ -72,11 +72,11 @@ public class SqlInfoBuilder {
         StringBuffer sqlBuffer = new StringBuffer();
 
         sqlBuffer.append("REPLACE INTO ");
-        sqlBuffer.append(Table.get(entity.getClass()).getTableName());
+        sqlBuffer.append(TableUtils.getTableName(entity.getClass()));
         sqlBuffer.append(" (");
         for (KeyValue kv : keyValueList) {
-            sqlBuffer.append(kv.getKey()).append(",");
-            result.addBindArg(kv.getValue());
+            sqlBuffer.append(kv.key).append(",");
+            result.addBindArgWithoutConverter(kv.value);
         }
         sqlBuffer.deleteCharAt(sqlBuffer.length() - 1);
         sqlBuffer.append(") VALUES (");
@@ -99,17 +99,18 @@ public class SqlInfoBuilder {
         return "DELETE FROM " + tableName;
     }
 
-    public static SqlInfo buildDeleteSqlInfo(Object entity) throws DbException {
+    public static SqlInfo buildDeleteSqlInfo(DbUtils db, Object entity) throws DbException {
         SqlInfo result = new SqlInfo();
 
-        Table table = Table.get(entity.getClass());
-        Id id = table.getId();
+        Class<?> entityType = entity.getClass();
+        Table table = Table.get(db, entityType);
+        Id id = table.id;
         Object idValue = id.getColumnValue(entity);
 
         if (idValue == null) {
             throw new DbException("this entity[" + entity.getClass() + "]'s id value is null");
         }
-        StringBuilder sb = new StringBuilder(buildDeleteSqlByTableName(table.getTableName()));
+        StringBuilder sb = new StringBuilder(buildDeleteSqlByTableName(table.tableName));
         sb.append(" WHERE ").append(WhereBuilder.b(id.getColumnName(), "=", idValue));
 
         result.setSql(sb.toString());
@@ -117,16 +118,16 @@ public class SqlInfoBuilder {
         return result;
     }
 
-    public static SqlInfo buildDeleteSqlInfo(Class<?> entityType, Object idValue) throws DbException {
+    public static SqlInfo buildDeleteSqlInfo(DbUtils db, Class<?> entityType, Object idValue) throws DbException {
         SqlInfo result = new SqlInfo();
 
-        Table table = Table.get(entityType);
-        Id id = table.getId();
+        Table table = Table.get(db, entityType);
+        Id id = table.id;
 
         if (null == idValue) {
             throw new DbException("this entity[" + entityType + "]'s id value is null");
         }
-        StringBuilder sb = new StringBuilder(buildDeleteSqlByTableName(table.getTableName()));
+        StringBuilder sb = new StringBuilder(buildDeleteSqlByTableName(table.tableName));
         sb.append(" WHERE ").append(WhereBuilder.b(id.getColumnName(), "=", idValue));
 
         result.setSql(sb.toString());
@@ -134,9 +135,9 @@ public class SqlInfoBuilder {
         return result;
     }
 
-    public static SqlInfo buildDeleteSqlInfo(Class<?> entityType, WhereBuilder whereBuilder) throws DbException {
-        Table table = Table.get(entityType);
-        StringBuilder sb = new StringBuilder(buildDeleteSqlByTableName(table.getTableName()));
+    public static SqlInfo buildDeleteSqlInfo(DbUtils db, Class<?> entityType, WhereBuilder whereBuilder) throws DbException {
+        Table table = Table.get(db, entityType);
+        StringBuilder sb = new StringBuilder(buildDeleteSqlByTableName(table.tableName));
 
         if (whereBuilder != null && whereBuilder.getWhereItemSize() > 0) {
             sb.append(" WHERE ").append(whereBuilder.toString());
@@ -158,8 +159,9 @@ public class SqlInfoBuilder {
             Collections.addAll(updateColumnNameSet, updateColumnNames);
         }
 
-        Table table = Table.get(entity.getClass());
-        Id id = table.getId();
+        Class<?> entityType = entity.getClass();
+        Table table = Table.get(db, entityType);
+        Id id = table.id;
         Object idValue = id.getColumnValue(entity);
 
         if (null == idValue) {
@@ -168,12 +170,12 @@ public class SqlInfoBuilder {
 
         SqlInfo result = new SqlInfo();
         StringBuffer sqlBuffer = new StringBuffer("UPDATE ");
-        sqlBuffer.append(table.getTableName());
+        sqlBuffer.append(table.tableName);
         sqlBuffer.append(" SET ");
         for (KeyValue kv : keyValueList) {
-            if (updateColumnNameSet == null || updateColumnNameSet.contains(kv.getValue())) {
-                sqlBuffer.append(kv.getKey()).append("=?,");
-                result.addBindArg(kv.getValue());
+            if (updateColumnNameSet == null || updateColumnNameSet.contains(kv.key)) {
+                sqlBuffer.append(kv.key).append("=?,");
+                result.addBindArgWithoutConverter(kv.value);
             }
         }
         sqlBuffer.deleteCharAt(sqlBuffer.length() - 1);
@@ -194,16 +196,17 @@ public class SqlInfoBuilder {
             Collections.addAll(updateColumnNameSet, updateColumnNames);
         }
 
-        Table table = Table.get(entity.getClass());
+        Class<?> entityType = entity.getClass();
+        String tableName = TableUtils.getTableName(entityType);
 
         SqlInfo result = new SqlInfo();
         StringBuffer sqlBuffer = new StringBuffer("UPDATE ");
-        sqlBuffer.append(table.getTableName());
+        sqlBuffer.append(tableName);
         sqlBuffer.append(" SET ");
         for (KeyValue kv : keyValueList) {
-            if (updateColumnNameSet == null || updateColumnNameSet.contains(kv.getValue())) {
-                sqlBuffer.append(kv.getKey()).append("=?,");
-                result.addBindArg(kv.getValue());
+            if (updateColumnNameSet == null || updateColumnNameSet.contains(kv.key)) {
+                sqlBuffer.append(kv.key).append("=?,");
+                result.addBindArgWithoutConverter(kv.value);
             }
         }
         sqlBuffer.deleteCharAt(sqlBuffer.length() - 1);
@@ -217,13 +220,13 @@ public class SqlInfoBuilder {
 
     //*********************************************** others ***********************************************
 
-    public static SqlInfo buildCreateTableSqlInfo(Class<?> entityType) throws DbException {
-        Table table = Table.get(entityType);
+    public static SqlInfo buildCreateTableSqlInfo(DbUtils db, Class<?> entityType) throws DbException {
+        Table table = Table.get(db, entityType);
+        Id id = table.id;
 
-        Id id = table.getId();
         StringBuffer sqlBuffer = new StringBuffer();
         sqlBuffer.append("CREATE TABLE IF NOT EXISTS ");
-        sqlBuffer.append(table.getTableName());
+        sqlBuffer.append(table.tableName);
         sqlBuffer.append(" ( ");
 
         if (id.isAutoIncrement()) {
@@ -260,9 +263,9 @@ public class SqlInfoBuilder {
     private static KeyValue column2KeyValue(Object entity, Column column) {
         KeyValue kv = null;
         String key = column.getColumnName();
-        Object value = column.getColumnValue(entity);
-        value = value == null ? column.getDefaultValue() : value;
-        if (key != null && value != null) {
+        if (key != null) {
+            Object value = column.getColumnValue(entity);
+            value = value == null ? column.getDefaultValue() : value;
             kv = new KeyValue(key, value);
         }
         return kv;
@@ -272,11 +275,12 @@ public class SqlInfoBuilder {
 
         List<KeyValue> keyValueList = new ArrayList<KeyValue>();
 
-        Table table = Table.get(entity.getClass());
-        Id id = table.getId();
+        Class<?> entityType = entity.getClass();
+        Table table = Table.get(db, entityType);
+        Id id = table.id;
 
         if (!id.isAutoIncrement()) {
-            Object idValue = TableUtils.getIdValue(entity);
+            Object idValue = id.getColumnValue(entity);
             KeyValue kv = new KeyValue(id.getColumnName(), idValue);
             keyValueList.add(kv);
         }
@@ -284,9 +288,7 @@ public class SqlInfoBuilder {
         Collection<Column> columns = table.columnMap.values();
         for (Column column : columns) {
             if (column instanceof Finder) {
-                ((Finder) column).db = db;
-            } else if (column instanceof Foreign) {
-                ((Foreign) column).db = db;
+                continue;
             }
             KeyValue kv = column2KeyValue(entity, column);
             if (kv != null) {

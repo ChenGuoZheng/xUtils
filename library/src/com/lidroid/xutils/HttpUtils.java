@@ -17,17 +17,15 @@ package com.lidroid.xutils;
 
 import android.text.TextUtils;
 import com.lidroid.xutils.exception.HttpException;
-import com.lidroid.xutils.http.HttpHandler;
-import com.lidroid.xutils.http.RequestCallBack;
-import com.lidroid.xutils.http.RetryHandler;
-import com.lidroid.xutils.http.SyncHttpHandler;
-import com.lidroid.xutils.http.client.HttpGetCache;
+import com.lidroid.xutils.http.*;
+import com.lidroid.xutils.http.callback.HttpRedirectHandler;
+import com.lidroid.xutils.http.callback.RequestCallBack;
+import com.lidroid.xutils.http.client.DefaultSSLSocketFactory;
 import com.lidroid.xutils.http.client.HttpRequest;
-import com.lidroid.xutils.http.client.RequestParams;
-import com.lidroid.xutils.http.client.ResponseStream;
-import com.lidroid.xutils.http.client.callback.HttpRedirectHandler;
+import com.lidroid.xutils.http.client.RetryHandler;
 import com.lidroid.xutils.http.client.entity.GZipDecompressingEntity;
-import com.lidroid.xutils.util.core.SimpleSSLSocketFactory;
+import com.lidroid.xutils.task.PriorityExecutor;
+import com.lidroid.xutils.util.OtherUtils;
 import org.apache.http.*;
 import org.apache.http.client.CookieStore;
 import org.apache.http.client.HttpClient;
@@ -50,14 +48,10 @@ import org.apache.http.protocol.HttpContext;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public class HttpUtils {
 
-    public final static HttpGetCache sHttpGetCache = new HttpGetCache();
+    public final static HttpCache sHttpCache = new HttpCache();
 
     private final DefaultHttpClient httpClient;
     private final HttpContext httpContext = new BasicHttpContext();
@@ -65,15 +59,28 @@ public class HttpUtils {
     private HttpRedirectHandler httpRedirectHandler;
 
     public HttpUtils() {
-        this(HttpUtils.DEFAULT_CONN_TIMEOUT);
+        this(HttpUtils.DEFAULT_CONN_TIMEOUT, null);
     }
 
     public HttpUtils(int connTimeout) {
+        this(connTimeout, null);
+    }
+
+    public HttpUtils(String userAgent) {
+        this(HttpUtils.DEFAULT_CONN_TIMEOUT, userAgent);
+    }
+
+    public HttpUtils(int connTimeout, String userAgent) {
         HttpParams params = new BasicHttpParams();
 
         ConnManagerParams.setTimeout(params, connTimeout);
         HttpConnectionParams.setSoTimeout(params, connTimeout);
         HttpConnectionParams.setConnectionTimeout(params, connTimeout);
+
+        if (TextUtils.isEmpty(userAgent)) {
+            userAgent = OtherUtils.getUserAgent(null);
+        }
+        HttpProtocolParams.setUserAgent(params, userAgent);
 
         ConnManagerParams.setMaxConnectionsPerRoute(params, new ConnPerRouteBean(10));
         ConnManagerParams.setMaxTotalConnections(params, 10);
@@ -84,7 +91,7 @@ public class HttpUtils {
 
         SchemeRegistry schemeRegistry = new SchemeRegistry();
         schemeRegistry.register(new Scheme("http", PlainSocketFactory.getSocketFactory(), 80));
-        schemeRegistry.register(new Scheme("https", SimpleSSLSocketFactory.getSocketFactory(), 443));
+        schemeRegistry.register(new Scheme("https", DefaultSSLSocketFactory.getSocketFactory(), 443));
 
         httpClient = new DefaultHttpClient(new ThreadSafeClientConnManager(params, schemeRegistry), params);
 
@@ -121,9 +128,9 @@ public class HttpUtils {
 
     // ************************************    default settings & fields ****************************
 
-    private String defaultResponseTextCharset = HTTP.UTF_8;
+    private String responseTextCharset = HTTP.UTF_8;
 
-    private long currentRequestExpiry = HttpGetCache.getDefaultExpiryTime();
+    private long currentRequestExpiry = HttpCache.getDefaultExpiryTime();
 
     private final static int DEFAULT_CONN_TIMEOUT = 1000 * 15; // 15s
 
@@ -132,20 +139,8 @@ public class HttpUtils {
     private static final String HEADER_ACCEPT_ENCODING = "Accept-Encoding";
     private static final String ENCODING_GZIP = "gzip";
 
-    private static final ThreadFactory sThreadFactory = new ThreadFactory() {
-        private final AtomicInteger mCount = new AtomicInteger(1);
-
-        @Override
-        public Thread newThread(Runnable r) {
-            Thread thread = new Thread(r, "HttpUtils #" + mCount.getAndIncrement());
-            thread.setPriority(Thread.NORM_PRIORITY - 1);
-            return thread;
-        }
-    };
-
-    private static int threadPoolSize = 3;
-
-    private static Executor executor = Executors.newFixedThreadPool(threadPoolSize, sThreadFactory);
+    private final static int DEFAULT_POOL_SIZE = 3;
+    private final static PriorityExecutor EXECUTOR = new PriorityExecutor(DEFAULT_POOL_SIZE);
 
     public HttpClient getHttpClient() {
         return this.httpClient;
@@ -153,15 +148,10 @@ public class HttpUtils {
 
     // ***************************************** config *******************************************
 
-    public HttpUtils configDefaultResponseTextCharset(String charSet) {
+    public HttpUtils configResponseTextCharset(String charSet) {
         if (!TextUtils.isEmpty(charSet)) {
-            this.defaultResponseTextCharset = charSet;
+            this.responseTextCharset = charSet;
         }
-        return this;
-    }
-
-    public HttpUtils configHttpGetCacheSize(int httpGetCacheSize) {
-        sHttpGetCache.setCacheSize(httpGetCacheSize);
         return this;
     }
 
@@ -170,13 +160,18 @@ public class HttpUtils {
         return this;
     }
 
-    public HttpUtils configDefaultHttpGetCacheExpiry(long defaultExpiry) {
-        HttpGetCache.setDefaultExpiryTime(defaultExpiry);
-        currentRequestExpiry = HttpGetCache.getDefaultExpiryTime();
+    public HttpUtils configHttpCacheSize(int httpCacheSize) {
+        sHttpCache.setCacheSize(httpCacheSize);
         return this;
     }
 
-    public HttpUtils configCurrentHttpGetCacheExpiry(long currRequestExpiry) {
+    public HttpUtils configDefaultHttpCacheExpiry(long defaultExpiry) {
+        HttpCache.setDefaultExpiryTime(defaultExpiry);
+        currentRequestExpiry = HttpCache.getDefaultExpiryTime();
+        return this;
+    }
+
+    public HttpUtils configCurrentHttpCacheExpiry(long currRequestExpiry) {
         this.currentRequestExpiry = currRequestExpiry;
         return this;
     }
@@ -194,8 +189,13 @@ public class HttpUtils {
     public HttpUtils configTimeout(int timeout) {
         final HttpParams httpParams = this.httpClient.getParams();
         ConnManagerParams.setTimeout(httpParams, timeout);
-        HttpConnectionParams.setSoTimeout(httpParams, timeout);
         HttpConnectionParams.setConnectionTimeout(httpParams, timeout);
+        return this;
+    }
+
+    public HttpUtils configSoTimeout(int timeout) {
+        final HttpParams httpParams = this.httpClient.getParams();
+        HttpConnectionParams.setSoTimeout(httpParams, timeout);
         return this;
     }
 
@@ -216,10 +216,7 @@ public class HttpUtils {
     }
 
     public HttpUtils configRequestThreadPoolSize(int threadPoolSize) {
-        if (threadPoolSize > 0 && threadPoolSize != HttpUtils.threadPoolSize) {
-            HttpUtils.threadPoolSize = threadPoolSize;
-            HttpUtils.executor = Executors.newFixedThreadPool(threadPoolSize, sThreadFactory);
-        }
+        HttpUtils.EXECUTOR.setPoolSize(threadPoolSize);
         return this;
     }
 
@@ -232,15 +229,10 @@ public class HttpUtils {
 
     public <T> HttpHandler<T> send(HttpRequest.HttpMethod method, String url, RequestParams params,
                                    RequestCallBack<T> callBack) {
-        return send(method, url, params, null, callBack);
-    }
-
-    public <T> HttpHandler<T> send(HttpRequest.HttpMethod method, String url, RequestParams params, String contentType,
-                                   RequestCallBack<T> callBack) {
         if (url == null) throw new IllegalArgumentException("url may not be null");
 
         HttpRequest request = new HttpRequest(method, url);
-        return sendRequest(request, params, contentType, callBack);
+        return sendRequest(request, params, callBack);
     }
 
     public ResponseStream sendSync(HttpRequest.HttpMethod method, String url) throws HttpException {
@@ -248,14 +240,10 @@ public class HttpUtils {
     }
 
     public ResponseStream sendSync(HttpRequest.HttpMethod method, String url, RequestParams params) throws HttpException {
-        return sendSync(method, url, params, null);
-    }
-
-    public ResponseStream sendSync(HttpRequest.HttpMethod method, String url, RequestParams params, String contentType) throws HttpException {
         if (url == null) throw new IllegalArgumentException("url may not be null");
 
         HttpRequest request = new HttpRequest(method, url);
-        return sendSyncRequest(request, params, contentType);
+        return sendSyncRequest(request, params);
     }
 
     // ***************************************** download *******************************************
@@ -291,21 +279,6 @@ public class HttpUtils {
     }
 
     public HttpHandler<File> download(HttpRequest.HttpMethod method, String url, String target,
-                                      RequestCallBack<File> callback) {
-        return download(method, url, target, null, false, false, callback);
-    }
-
-    public HttpHandler<File> download(HttpRequest.HttpMethod method, String url, String target,
-                                      boolean autoResume, RequestCallBack<File> callback) {
-        return download(method, url, target, null, autoResume, false, callback);
-    }
-
-    public HttpHandler<File> download(HttpRequest.HttpMethod method, String url, String target,
-                                      boolean autoResume, boolean autoRename, RequestCallBack<File> callback) {
-        return download(method, url, target, null, autoResume, autoRename, callback);
-    }
-
-    public HttpHandler<File> download(HttpRequest.HttpMethod method, String url, String target,
                                       RequestParams params, RequestCallBack<File> callback) {
         return download(method, url, target, params, false, false, callback);
     }
@@ -323,38 +296,38 @@ public class HttpUtils {
 
         HttpRequest request = new HttpRequest(method, url);
 
-        HttpHandler<File> handler = new HttpHandler<File>(httpClient, httpContext, defaultResponseTextCharset, callback);
+        HttpHandler<File> handler = new HttpHandler<File>(httpClient, httpContext, responseTextCharset, callback);
 
         handler.setExpiry(currentRequestExpiry);
         handler.setHttpRedirectHandler(httpRedirectHandler);
-        request.setRequestParams(params, handler);
 
-        handler.executeOnExecutor(executor, request, target, autoResume, autoRename);
+        if (params != null) {
+            request.setRequestParams(params, handler);
+            handler.setPriority(params.getPriority());
+        }
+        handler.executeOnExecutor(EXECUTOR, request, target, autoResume, autoRename);
         return handler;
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    private <T> HttpHandler<T> sendRequest(HttpRequest request, RequestParams params, String contentType, RequestCallBack<T> callBack) {
-        if (contentType != null) {
-            request.setHeader("Content-Type", contentType);
-        }
+    private <T> HttpHandler<T> sendRequest(HttpRequest request, RequestParams params, RequestCallBack<T> callBack) {
 
-        HttpHandler<T> handler = new HttpHandler<T>(httpClient, httpContext, defaultResponseTextCharset, callBack);
+        HttpHandler<T> handler = new HttpHandler<T>(httpClient, httpContext, responseTextCharset, callBack);
 
         handler.setExpiry(currentRequestExpiry);
         handler.setHttpRedirectHandler(httpRedirectHandler);
         request.setRequestParams(params, handler);
 
-        handler.executeOnExecutor(executor, request);
+        if (params != null) {
+            handler.setPriority(params.getPriority());
+        }
+        handler.executeOnExecutor(EXECUTOR, request);
         return handler;
     }
 
-    private ResponseStream sendSyncRequest(HttpRequest request, RequestParams params, String contentType) throws HttpException {
-        if (contentType != null) {
-            request.setHeader("Content-Type", contentType);
-        }
+    private ResponseStream sendSyncRequest(HttpRequest request, RequestParams params) throws HttpException {
 
-        SyncHttpHandler handler = new SyncHttpHandler(httpClient, httpContext, defaultResponseTextCharset);
+        SyncHttpHandler handler = new SyncHttpHandler(httpClient, httpContext, responseTextCharset);
 
         handler.setExpiry(currentRequestExpiry);
         handler.setHttpRedirectHandler(httpRedirectHandler);

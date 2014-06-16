@@ -15,14 +15,15 @@
 
 package com.lidroid.xutils;
 
-import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
-import android.database.sqlite.SQLiteOpenHelper;
 import android.text.TextUtils;
 import com.lidroid.xutils.db.sqlite.*;
-import com.lidroid.xutils.db.table.*;
+import com.lidroid.xutils.db.table.DbModel;
+import com.lidroid.xutils.db.table.Id;
+import com.lidroid.xutils.db.table.Table;
+import com.lidroid.xutils.db.table.TableUtils;
 import com.lidroid.xutils.exception.DbException;
 import com.lidroid.xutils.util.IOUtils;
 import com.lidroid.xutils.util.LogUtils;
@@ -32,6 +33,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class DbUtils {
 
@@ -43,7 +46,7 @@ public class DbUtils {
     private static HashMap<String, DbUtils> daoMap = new HashMap<String, DbUtils>();
 
     private SQLiteDatabase database;
-    private DaoConfig config;
+    private DaoConfig daoConfig;
     private boolean debug = false;
     private boolean allowTransaction = false;
 
@@ -51,18 +54,8 @@ public class DbUtils {
         if (config == null) {
             throw new IllegalArgumentException("daoConfig may not be null");
         }
-
-        if (config.getContext() == null) {
-            throw new IllegalArgumentException("context mey not be null");
-        }
-
-        String sdCardPath = config.getSdCardPath();
-        if (TextUtils.isEmpty(sdCardPath)) {
-            this.database = new SQLiteDbHelper(config).getWritableDatabase();
-        } else {
-            this.database = createDbFileOnSDCard(config);
-        }
-        this.config = config;
+        this.database = createDatabase(config);
+        this.daoConfig = config;
     }
 
 
@@ -72,8 +65,29 @@ public class DbUtils {
             dao = new DbUtils(daoConfig);
             daoMap.put(daoConfig.getDbName(), dao);
         } else {
-            dao.config = daoConfig;
+            dao.daoConfig = daoConfig;
         }
+
+        // update the database if needed
+        SQLiteDatabase database = dao.database;
+        int oldVersion = database.getVersion();
+        int newVersion = daoConfig.getDbVersion();
+        if (oldVersion != newVersion) {
+            if (oldVersion != 0) {
+                DbUpgradeListener upgradeListener = daoConfig.getDbUpgradeListener();
+                if (upgradeListener != null) {
+                    upgradeListener.onUpgrade(dao, oldVersion, newVersion);
+                } else {
+                    try {
+                        dao.dropDb();
+                    } catch (DbException e) {
+                        LogUtils.e(e.getMessage(), e);
+                    }
+                }
+            }
+            database.setVersion(newVersion);
+        }
+
         return dao;
     }
 
@@ -88,9 +102,9 @@ public class DbUtils {
         return getInstance(config);
     }
 
-    public static DbUtils create(Context context, String sdCardPath, String dbName) {
+    public static DbUtils create(Context context, String dbDir, String dbName) {
         DaoConfig config = new DaoConfig(context);
-        config.setSdCardPath(sdCardPath);
+        config.setDbDir(dbDir);
         config.setDbName(dbName);
         return getInstance(config);
     }
@@ -103,9 +117,9 @@ public class DbUtils {
         return getInstance(config);
     }
 
-    public static DbUtils create(Context context, String sdCardPath, String dbName, int dbVersion, DbUpgradeListener dbUpgradeListener) {
+    public static DbUtils create(Context context, String dbDir, String dbName, int dbVersion, DbUpgradeListener dbUpgradeListener) {
         DaoConfig config = new DaoConfig(context);
-        config.setSdCardPath(sdCardPath);
+        config.setDbDir(dbDir);
         config.setDbName(dbName);
         config.setDbVersion(dbVersion);
         config.setDbUpgradeListener(dbUpgradeListener);
@@ -130,12 +144,17 @@ public class DbUtils {
         return database;
     }
 
+    public DaoConfig getDaoConfig() {
+        return daoConfig;
+    }
+
     //*********************************************** operations ********************************************************
 
     public void saveOrUpdate(Object entity) throws DbException {
         try {
             beginTransaction();
 
+            createTableIfNotExist(entity.getClass());
             saveOrUpdateWithoutTransaction(entity);
 
             setTransactionSuccessful();
@@ -145,9 +164,11 @@ public class DbUtils {
     }
 
     public void saveOrUpdateAll(List<?> entities) throws DbException {
+        if (entities == null || entities.size() == 0) return;
         try {
             beginTransaction();
 
+            createTableIfNotExist(entities.get(0).getClass());
             for (Object entity : entities) {
                 saveOrUpdateWithoutTransaction(entity);
             }
@@ -162,7 +183,8 @@ public class DbUtils {
         try {
             beginTransaction();
 
-            replaceWithoutTransaction(entity);
+            createTableIfNotExist(entity.getClass());
+            execNonQuery(SqlInfoBuilder.buildReplaceSqlInfo(this, entity));
 
             setTransactionSuccessful();
         } finally {
@@ -171,11 +193,13 @@ public class DbUtils {
     }
 
     public void replaceAll(List<?> entities) throws DbException {
+        if (entities == null || entities.size() == 0) return;
         try {
             beginTransaction();
 
+            createTableIfNotExist(entities.get(0).getClass());
             for (Object entity : entities) {
-                replaceWithoutTransaction(entity);
+                execNonQuery(SqlInfoBuilder.buildReplaceSqlInfo(this, entity));
             }
 
             setTransactionSuccessful();
@@ -188,7 +212,8 @@ public class DbUtils {
         try {
             beginTransaction();
 
-            saveWithoutTransaction(entity);
+            createTableIfNotExist(entity.getClass());
+            execNonQuery(SqlInfoBuilder.buildInsertSqlInfo(this, entity));
 
             setTransactionSuccessful();
         } finally {
@@ -197,11 +222,13 @@ public class DbUtils {
     }
 
     public void saveAll(List<?> entities) throws DbException {
+        if (entities == null || entities.size() == 0) return;
         try {
             beginTransaction();
 
+            createTableIfNotExist(entities.get(0).getClass());
             for (Object entity : entities) {
-                saveWithoutTransaction(entity);
+                execNonQuery(SqlInfoBuilder.buildInsertSqlInfo(this, entity));
             }
 
             setTransactionSuccessful();
@@ -215,6 +242,7 @@ public class DbUtils {
         try {
             beginTransaction();
 
+            createTableIfNotExist(entity.getClass());
             result = saveBindingIdWithoutTransaction(entity);
 
             setTransactionSuccessful();
@@ -225,9 +253,11 @@ public class DbUtils {
     }
 
     public void saveBindingIdAll(List<?> entities) throws DbException {
+        if (entities == null || entities.size() == 0) return;
         try {
             beginTransaction();
 
+            createTableIfNotExist(entities.get(0).getClass());
             for (Object entity : entities) {
                 if (!saveBindingIdWithoutTransaction(entity)) {
                     throw new DbException("saveBindingId error, transaction will not commit!");
@@ -240,55 +270,25 @@ public class DbUtils {
         }
     }
 
+    public void deleteById(Class<?> entityType, Object idValue) throws DbException {
+        if (!tableIsExist(entityType)) return;
+        try {
+            beginTransaction();
+
+            execNonQuery(SqlInfoBuilder.buildDeleteSqlInfo(this, entityType, idValue));
+
+            setTransactionSuccessful();
+        } finally {
+            endTransaction();
+        }
+    }
 
     public void delete(Object entity) throws DbException {
         if (!tableIsExist(entity.getClass())) return;
         try {
             beginTransaction();
 
-            deleteWithoutTransaction(entity);
-
-            setTransactionSuccessful();
-        } finally {
-            endTransaction();
-        }
-    }
-
-    public void deleteAll(List<?> entities) throws DbException {
-        if (entities == null || entities.size() < 1 || !tableIsExist(entities.get(0).getClass())) return;
-        try {
-            beginTransaction();
-
-            for (Object entity : entities) {
-                deleteWithoutTransaction(entity);
-            }
-
-            setTransactionSuccessful();
-        } finally {
-            endTransaction();
-        }
-    }
-
-    public void deleteAll(Class<?> entityType) throws DbException {
-        if (!tableIsExist(entityType)) return;
-        try {
-            beginTransaction();
-
-            SqlInfo sql = SqlInfoBuilder.buildDeleteSqlInfo(entityType, null);
-            execNonQuery(sql);
-
-            setTransactionSuccessful();
-        } finally {
-            endTransaction();
-        }
-    }
-
-    public void deleteById(Class<?> entityType, Object idValue) throws DbException {
-        if (!tableIsExist(entityType)) return;
-        try {
-            beginTransaction();
-
-            execNonQuery(SqlInfoBuilder.buildDeleteSqlInfo(entityType, idValue));
+            execNonQuery(SqlInfoBuilder.buildDeleteSqlInfo(this, entity));
 
             setTransactionSuccessful();
         } finally {
@@ -301,8 +301,7 @@ public class DbUtils {
         try {
             beginTransaction();
 
-            SqlInfo sql = SqlInfoBuilder.buildDeleteSqlInfo(entityType, whereBuilder);
-            execNonQuery(sql);
+            execNonQuery(SqlInfoBuilder.buildDeleteSqlInfo(this, entityType, whereBuilder));
 
             setTransactionSuccessful();
         } finally {
@@ -310,36 +309,13 @@ public class DbUtils {
         }
     }
 
-    /**
-     * @param entity
-     * @param updateColumnNames if null, update all columns.
-     * @throws DbException
-     */
-    public void update(Object entity, String... updateColumnNames) throws DbException {
-        if (!tableIsExist(entity.getClass())) return;
-        try {
-            beginTransaction();
-
-            updateWithoutTransaction(entity, updateColumnNames);
-
-            setTransactionSuccessful();
-        } finally {
-            endTransaction();
-        }
-    }
-
-    /**
-     * @param entities
-     * @param updateColumnNames if null, update all columns.
-     * @throws DbException
-     */
-    public void updateAll(List<?> entities, String... updateColumnNames) throws DbException {
-        if (entities == null || entities.size() < 1 || !tableIsExist(entities.get(0).getClass())) return;
+    public void deleteAll(List<?> entities) throws DbException {
+        if (entities == null || entities.size() == 0 || !tableIsExist(entities.get(0).getClass())) return;
         try {
             beginTransaction();
 
             for (Object entity : entities) {
-                updateWithoutTransaction(entity, updateColumnNames);
+                execNonQuery(SqlInfoBuilder.buildDeleteSqlInfo(this, entity));
             }
 
             setTransactionSuccessful();
@@ -348,12 +324,23 @@ public class DbUtils {
         }
     }
 
-    /**
-     * @param entity
-     * @param whereBuilder
-     * @param updateColumnNames if null, update all columns.
-     * @throws DbException
-     */
+    public void deleteAll(Class<?> entityType) throws DbException {
+        delete(entityType, null);
+    }
+
+    public void update(Object entity, String... updateColumnNames) throws DbException {
+        if (!tableIsExist(entity.getClass())) return;
+        try {
+            beginTransaction();
+
+            execNonQuery(SqlInfoBuilder.buildUpdateSqlInfo(this, entity, updateColumnNames));
+
+            setTransactionSuccessful();
+        } finally {
+            endTransaction();
+        }
+    }
+
     public void update(Object entity, WhereBuilder whereBuilder, String... updateColumnNames) throws DbException {
         if (!tableIsExist(entity.getClass())) return;
         try {
@@ -367,12 +354,42 @@ public class DbUtils {
         }
     }
 
+    public void updateAll(List<?> entities, String... updateColumnNames) throws DbException {
+        if (entities == null || entities.size() == 0 || !tableIsExist(entities.get(0).getClass())) return;
+        try {
+            beginTransaction();
+
+            for (Object entity : entities) {
+                execNonQuery(SqlInfoBuilder.buildUpdateSqlInfo(this, entity, updateColumnNames));
+            }
+
+            setTransactionSuccessful();
+        } finally {
+            endTransaction();
+        }
+    }
+
+    public void updateAll(List<?> entities, WhereBuilder whereBuilder, String... updateColumnNames) throws DbException {
+        if (entities == null || entities.size() == 0 || !tableIsExist(entities.get(0).getClass())) return;
+        try {
+            beginTransaction();
+
+            for (Object entity : entities) {
+                execNonQuery(SqlInfoBuilder.buildUpdateSqlInfo(this, entity, whereBuilder, updateColumnNames));
+            }
+
+            setTransactionSuccessful();
+        } finally {
+            endTransaction();
+        }
+    }
+
     @SuppressWarnings("unchecked")
     public <T> T findById(Class<T> entityType, Object idValue) throws DbException {
         if (!tableIsExist(entityType)) return null;
 
-        Id id = Table.get(entityType).getId();
-        Selector selector = Selector.from(entityType).where(id.getColumnName(), "=", idValue);
+        Table table = Table.get(this, entityType);
+        Selector selector = Selector.from(entityType).where(table.id.getColumnName(), "=", idValue);
 
         String sql = selector.limit(1).toString();
         long seq = CursorUtils.FindCacheSequence.getSeq();
@@ -383,14 +400,18 @@ public class DbUtils {
         }
 
         Cursor cursor = execQuery(sql);
-        try {
-            if (cursor.moveToNext()) {
-                T entity = (T) CursorUtils.getEntity(this, cursor, entityType, seq);
-                findTempCache.put(sql, entity);
-                return entity;
+        if (cursor != null) {
+            try {
+                if (cursor.moveToNext()) {
+                    T entity = (T) CursorUtils.getEntity(this, cursor, entityType, seq);
+                    findTempCache.put(sql, entity);
+                    return entity;
+                }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
         return null;
     }
@@ -408,33 +429,24 @@ public class DbUtils {
         }
 
         Cursor cursor = execQuery(sql);
-        try {
-            if (cursor.moveToNext()) {
-                T entity = (T) CursorUtils.getEntity(this, cursor, selector.getEntityType(), seq);
-                findTempCache.put(sql, entity);
-                return entity;
+        if (cursor != null) {
+            try {
+                if (cursor.moveToNext()) {
+                    T entity = (T) CursorUtils.getEntity(this, cursor, selector.getEntityType(), seq);
+                    findTempCache.put(sql, entity);
+                    return entity;
+                }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
         return null;
     }
 
-    public <T> T findFirst(Object entity) throws DbException {
-        if (!tableIsExist(entity.getClass())) return null;
-        Selector selector = Selector.from(entity.getClass());
-        List<KeyValue> entityKvList = SqlInfoBuilder.entity2KeyValueList(this, entity);
-        if (entityKvList != null) {
-            WhereBuilder wb = WhereBuilder.b();
-            for (KeyValue keyValue : entityKvList) {
-                Object value = keyValue.getValue();
-                if (value != null) {
-                    wb.and(keyValue.getKey(), "=", value);
-                }
-            }
-            selector.where(wb);
-        }
-        return findFirst(selector);
+    public <T> T findFirst(Class<T> entityType) throws DbException {
+        return findFirst(Selector.from(entityType));
     }
 
     @SuppressWarnings("unchecked")
@@ -449,87 +461,112 @@ public class DbUtils {
             return (List<T>) obj;
         }
 
-        Cursor cursor = execQuery(sql);
         List<T> result = new ArrayList<T>();
-        try {
-            while (cursor.moveToNext()) {
-                T entity = (T) CursorUtils.getEntity(this, cursor, selector.getEntityType(), seq);
-                result.add(entity);
+
+        Cursor cursor = execQuery(sql);
+        if (cursor != null) {
+            try {
+                while (cursor.moveToNext()) {
+                    T entity = (T) CursorUtils.getEntity(this, cursor, selector.getEntityType(), seq);
+                    result.add(entity);
+                }
+                findTempCache.put(sql, result);
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-            findTempCache.put(sql, result);
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
         return result;
     }
 
-    public <T> List<T> findAll(Object entity) throws DbException {
-        if (!tableIsExist(entity.getClass())) return null;
-        Selector selector = Selector.from(entity.getClass());
-        List<KeyValue> entityKvList = SqlInfoBuilder.entity2KeyValueList(this, entity);
-        if (entityKvList != null) {
-            WhereBuilder wb = WhereBuilder.b();
-            for (KeyValue keyValue : entityKvList) {
-                Object value = keyValue.getValue();
-                if (value != null) {
-                    wb.and(keyValue.getKey(), "=", value);
-                }
-            }
-            selector.where(wb);
-        }
-        return findAll(selector);
+    public <T> List<T> findAll(Class<T> entityType) throws DbException {
+        return findAll(Selector.from(entityType));
     }
 
     public DbModel findDbModelFirst(SqlInfo sqlInfo) throws DbException {
         Cursor cursor = execQuery(sqlInfo);
-        try {
-            if (cursor.moveToNext()) {
-                return CursorUtils.getDbModel(cursor);
+        if (cursor != null) {
+            try {
+                if (cursor.moveToNext()) {
+                    return CursorUtils.getDbModel(cursor);
+                }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
         return null;
     }
 
     public DbModel findDbModelFirst(DbModelSelector selector) throws DbException {
         if (!tableIsExist(selector.getEntityType())) return null;
+
         Cursor cursor = execQuery(selector.limit(1).toString());
-        try {
-            if (cursor.moveToNext()) {
-                return CursorUtils.getDbModel(cursor);
+        if (cursor != null) {
+            try {
+                if (cursor.moveToNext()) {
+                    return CursorUtils.getDbModel(cursor);
+                }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
         return null;
     }
 
     public List<DbModel> findDbModelAll(SqlInfo sqlInfo) throws DbException {
-        Cursor cursor = execQuery(sqlInfo);
         List<DbModel> dbModelList = new ArrayList<DbModel>();
-        try {
-            while (cursor.moveToNext()) {
-                dbModelList.add(CursorUtils.getDbModel(cursor));
+
+        Cursor cursor = execQuery(sqlInfo);
+        if (cursor != null) {
+            try {
+                while (cursor.moveToNext()) {
+                    dbModelList.add(CursorUtils.getDbModel(cursor));
+                }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
         return dbModelList;
     }
 
     public List<DbModel> findDbModelAll(DbModelSelector selector) throws DbException {
         if (!tableIsExist(selector.getEntityType())) return null;
-        Cursor cursor = execQuery(selector.toString());
+
         List<DbModel> dbModelList = new ArrayList<DbModel>();
-        try {
-            while (cursor.moveToNext()) {
-                dbModelList.add(CursorUtils.getDbModel(cursor));
+
+        Cursor cursor = execQuery(selector.toString());
+        if (cursor != null) {
+            try {
+                while (cursor.moveToNext()) {
+                    dbModelList.add(CursorUtils.getDbModel(cursor));
+                }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
         return dbModelList;
+    }
+
+    public long count(Selector selector) throws DbException {
+        Class<?> entityType = selector.getEntityType();
+        if (!tableIsExist(entityType)) return 0;
+
+        Table table = Table.get(this, entityType);
+        DbModelSelector dmSelector = selector.select("count(" + table.id.getColumnName() + ") as count");
+        return findDbModelFirst(dmSelector).getLong("count");
+    }
+
+    public long count(Class<?> entityType) throws DbException {
+        return count(Selector.from(entityType));
     }
 
     //******************************************** config ******************************************************
@@ -540,7 +577,7 @@ public class DbUtils {
         private int dbVersion = 1;
         private DbUpgradeListener dbUpgradeListener;
 
-        private String sdCardPath;
+        private String dbDir;
 
         public DaoConfig(Context context) {
             this.context = context;
@@ -555,7 +592,9 @@ public class DbUtils {
         }
 
         public void setDbName(String dbName) {
-            this.dbName = dbName;
+            if (!TextUtils.isEmpty(dbName)) {
+                this.dbName = dbName;
+            }
         }
 
         public int getDbVersion() {
@@ -574,201 +613,182 @@ public class DbUtils {
             this.dbUpgradeListener = dbUpgradeListener;
         }
 
-        public String getSdCardPath() {
-            return sdCardPath;
+        public String getDbDir() {
+            return dbDir;
         }
 
-        public void setSdCardPath(String sdCardPath) {
-            this.sdCardPath = sdCardPath;
+        /**
+         * set database dir
+         *
+         * @param dbDir If dbDir is null or empty, use the app default db dir.
+         */
+        public void setDbDir(String dbDir) {
+            this.dbDir = dbDir;
         }
     }
 
     public interface DbUpgradeListener {
-        public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion);
+        public void onUpgrade(DbUtils db, int oldVersion, int newVersion);
     }
 
-    private class SQLiteDbHelper extends SQLiteOpenHelper {
-
-        private DbUpgradeListener mDbUpgradeListener;
-
-        public SQLiteDbHelper(DaoConfig config) {
-            super(config.getContext(), config.getDbName(), null, config.getDbVersion());
-            this.mDbUpgradeListener = config.getDbUpgradeListener();
-        }
-
-        @Override
-        public void onCreate(SQLiteDatabase db) {
-        }
-
-        @Override
-        public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-            if (mDbUpgradeListener != null) {
-                mDbUpgradeListener.onUpgrade(db, oldVersion, newVersion);
-            } else {
-                try {
-                    dropDb();
-                } catch (DbException e) {
-                    LogUtils.e(e.getMessage(), e);
-                }
-            }
-        }
-    }
-
-    private SQLiteDatabase createDbFileOnSDCard(DaoConfig config) {
+    private SQLiteDatabase createDatabase(DaoConfig config) {
         SQLiteDatabase result = null;
 
-        File dbFile = new File(config.getSdCardPath(), config.getDbName());
-        boolean dbFileExists = dbFile.exists();
-        result = SQLiteDatabase.openOrCreateDatabase(dbFile, null);
-
-        if (result != null) {
-            int oldVersion = result.getVersion();
-            int newVersion = config.getDbVersion();
-            if (oldVersion != newVersion) {
-                if (dbFileExists && config.getDbUpgradeListener() != null) {
-                    config.getDbUpgradeListener().onUpgrade(result, oldVersion, newVersion);
-                }
-                result.setVersion(newVersion);
+        String dbDir = config.getDbDir();
+        if (!TextUtils.isEmpty(dbDir)) {
+            File dir = new File(dbDir);
+            if (dir.exists() || dir.mkdirs()) {
+                File dbFile = new File(dbDir, config.getDbName());
+                result = SQLiteDatabase.openOrCreateDatabase(dbFile, null);
             }
+        } else {
+            result = config.getContext().openOrCreateDatabase(config.getDbName(), 0, null);
         }
-
         return result;
     }
 
     //***************************** private operations with out transaction *****************************
     private void saveOrUpdateWithoutTransaction(Object entity) throws DbException {
-        Id id = TableUtils.getId(entity.getClass());
+        Table table = Table.get(this, entity.getClass());
+        Id id = table.id;
         if (id.isAutoIncrement()) {
-            if (TableUtils.getIdValue(entity) != null) {
-                updateWithoutTransaction(entity);
+            if (id.getColumnValue(entity) != null) {
+                execNonQuery(SqlInfoBuilder.buildUpdateSqlInfo(this, entity));
             } else {
                 saveBindingIdWithoutTransaction(entity);
             }
         } else {
-            replaceWithoutTransaction(entity);
+            execNonQuery(SqlInfoBuilder.buildReplaceSqlInfo(this, entity));
         }
     }
 
-    private void replaceWithoutTransaction(Object entity) throws DbException {
-        createTableIfNotExist(entity.getClass());
-        execNonQuery(SqlInfoBuilder.buildReplaceSqlInfo(this, entity));
-    }
-
-    private void saveWithoutTransaction(Object entity) throws DbException {
-        createTableIfNotExist(entity.getClass());
-        execNonQuery(SqlInfoBuilder.buildInsertSqlInfo(this, entity));
-    }
-
     private boolean saveBindingIdWithoutTransaction(Object entity) throws DbException {
-        createTableIfNotExist(entity.getClass());
-        Table table = Table.get(entity.getClass());
-        Id idColumn = table.getId();
+        Class<?> entityType = entity.getClass();
+        Table table = Table.get(this, entityType);
+        Id idColumn = table.id;
         if (idColumn.isAutoIncrement()) {
-            List<KeyValue> entityKvList = SqlInfoBuilder.entity2KeyValueList(this, entity);
-            if (entityKvList != null && entityKvList.size() > 0) {
-                ContentValues cv = new ContentValues();
-                DbUtils.fillContentValues(cv, entityKvList);
-                Long id = database.insert(table.getTableName(), null, cv);
-                if (id == -1) {
-                    return false;
-                }
-                idColumn.setValue2Entity(entity, id.toString());
-                return true;
+            execNonQuery(SqlInfoBuilder.buildInsertSqlInfo(this, entity));
+            long id = getLastAutoIncrementId(table.tableName);
+            if (id == -1) {
+                return false;
             }
+            idColumn.setAutoIncrementId(entity, id);
+            return true;
         } else {
             execNonQuery(SqlInfoBuilder.buildInsertSqlInfo(this, entity));
             return true;
         }
-        return false;
-    }
-
-    private void deleteWithoutTransaction(Object entity) throws DbException {
-        execNonQuery(SqlInfoBuilder.buildDeleteSqlInfo(entity));
-    }
-
-    private void updateWithoutTransaction(Object entity, String... updateColumnNames) throws DbException {
-        execNonQuery(SqlInfoBuilder.buildUpdateSqlInfo(this, entity, updateColumnNames));
     }
 
     //************************************************ tools ***********************************
 
-    private static void fillContentValues(ContentValues contentValues, List<KeyValue> list) {
-        if (list != null && contentValues != null) {
-            for (KeyValue kv : list) {
-                contentValues.put(kv.getKey(), kv.getValue().toString());
+    private long getLastAutoIncrementId(String tableName) throws DbException {
+        long id = -1;
+        Cursor cursor = execQuery("SELECT seq FROM sqlite_sequence WHERE name='" + tableName + "'");
+        if (cursor != null) {
+            try {
+                if (cursor.moveToNext()) {
+                    id = cursor.getLong(0);
+                }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } else {
-            LogUtils.w("List<KeyValue> is empty or ContentValues is empty!");
         }
+        return id;
     }
 
-    private void createTableIfNotExist(Class<?> entityType) throws DbException {
+    public void createTableIfNotExist(Class<?> entityType) throws DbException {
         if (!tableIsExist(entityType)) {
-            SqlInfo sqlInfo = SqlInfoBuilder.buildCreateTableSqlInfo(entityType);
+            SqlInfo sqlInfo = SqlInfoBuilder.buildCreateTableSqlInfo(this, entityType);
             execNonQuery(sqlInfo);
+            String execAfterTableCreated = TableUtils.getExecAfterTableCreated(entityType);
+            if (!TextUtils.isEmpty(execAfterTableCreated)) {
+                execNonQuery(execAfterTableCreated);
+            }
         }
     }
 
     public boolean tableIsExist(Class<?> entityType) throws DbException {
-        Table table = Table.get(entityType);
-        if (table.isCheckDatabase()) {
+        Table table = Table.get(this, entityType);
+        if (table.isCheckedDatabase()) {
             return true;
         }
 
-        Cursor cursor = null;
-        try {
-            cursor = execQuery("SELECT COUNT(*) AS c FROM sqlite_master WHERE type ='table' AND name ='" + table.getTableName() + "'");
-            if (cursor != null && cursor.moveToNext()) {
-                int count = cursor.getInt(0);
-                if (count > 0) {
-                    table.setCheckDatabase(true);
-                    return true;
+        Cursor cursor = execQuery("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='" + table.tableName + "'");
+        if (cursor != null) {
+            try {
+                if (cursor.moveToNext()) {
+                    int count = cursor.getInt(0);
+                    if (count > 0) {
+                        table.setCheckedDatabase(true);
+                        return true;
+                    }
                 }
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
 
         return false;
     }
 
     public void dropDb() throws DbException {
-        Cursor cursor = null;
-        try {
-            cursor = execQuery("SELECT name FROM sqlite_master WHERE type ='table'");
-            if (cursor != null) {
+        Cursor cursor = execQuery("SELECT name FROM sqlite_master WHERE type='table' AND name<>'sqlite_sequence'");
+        if (cursor != null) {
+            try {
                 while (cursor.moveToNext()) {
                     try {
                         String tableName = cursor.getString(0);
                         execNonQuery("DROP TABLE " + tableName);
-                        Table.remove(tableName);
+                        Table.remove(this, tableName);
                     } catch (Throwable e) {
                         LogUtils.e(e.getMessage(), e);
                     }
                 }
+
+            } catch (Throwable e) {
+                throw new DbException(e);
+            } finally {
+                IOUtils.closeQuietly(cursor);
             }
-        } finally {
-            IOUtils.closeQuietly(cursor);
         }
     }
 
     public void dropTable(Class<?> entityType) throws DbException {
         if (!tableIsExist(entityType)) return;
-        Table table = Table.get(entityType);
-        execNonQuery("DROP TABLE " + table.getTableName());
-        Table.remove(entityType);
+        String tableName = TableUtils.getTableName(entityType);
+        execNonQuery("DROP TABLE " + tableName);
+        Table.remove(this, entityType);
+    }
+
+    public void close() {
+        String dbName = this.daoConfig.getDbName();
+        if (daoMap.containsKey(dbName)) {
+            daoMap.remove(dbName);
+            this.database.close();
+        }
     }
 
     ///////////////////////////////////// exec sql /////////////////////////////////////////////////////
     private void debugSql(String sql) {
-        if (config != null && debug) {
+        if (debug) {
             LogUtils.d(sql);
         }
     }
 
+    private Lock writeLock = new ReentrantLock();
+    private volatile boolean writeLocked = false;
+
     private void beginTransaction() {
         if (allowTransaction) {
             database.beginTransaction();
+        } else {
+            writeLock.lock();
+            writeLocked = true;
         }
     }
 
@@ -781,6 +801,10 @@ public class DbUtils {
     private void endTransaction() {
         if (allowTransaction) {
             database.endTransaction();
+        }
+        if (writeLocked) {
+            writeLock.unlock();
+            writeLocked = false;
         }
     }
 
@@ -841,7 +865,9 @@ public class DbUtils {
         private long seq = 0;
 
         public void put(String sql, Object result) {
-            cache.put(sql, result);
+            if (sql != null && result != null) {
+                cache.put(sql, result);
+            }
         }
 
         public Object get(String sql) {

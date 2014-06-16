@@ -16,15 +16,19 @@
 package com.lidroid.xutils.bitmap.core;
 
 import android.graphics.Bitmap;
+import android.graphics.Matrix;
+import android.media.ExifInterface;
+import com.lidroid.xutils.BitmapUtils;
 import com.lidroid.xutils.bitmap.BitmapDisplayConfig;
 import com.lidroid.xutils.bitmap.BitmapGlobalConfig;
+import com.lidroid.xutils.cache.FileNameGenerator;
+import com.lidroid.xutils.cache.LruDiskCache;
+import com.lidroid.xutils.cache.LruMemoryCache;
 import com.lidroid.xutils.util.IOUtils;
 import com.lidroid.xutils.util.LogUtils;
-import com.lidroid.xutils.util.core.LruDiskCache;
-import com.lidroid.xutils.util.core.LruMemoryCache;
+import com.lidroid.xutils.util.OtherUtils;
 
 import java.io.*;
-import java.lang.ref.SoftReference;
 
 
 public class BitmapCache {
@@ -32,7 +36,7 @@ public class BitmapCache {
     private final int DISK_CACHE_INDEX = 0;
 
     private LruDiskCache mDiskLruCache;
-    private LruMemoryCache<String, SoftReference<Bitmap>> mMemoryCache;
+    private LruMemoryCache<MemoryCacheKey, Bitmap> mMemoryCache;
 
     private final Object mDiskCacheLock = new Object();
     private boolean isDiskCacheReadied = false;
@@ -63,14 +67,15 @@ public class BitmapCache {
             } catch (Throwable e) {
             }
         }
-        mMemoryCache = new LruMemoryCache<String, SoftReference<Bitmap>>(globalConfig.getMemoryCacheSize()) {
+        mMemoryCache = new LruMemoryCache<MemoryCacheKey, Bitmap>(globalConfig.getMemoryCacheSize()) {
             /**
              * Measure item size in bytes rather than units which is more practical
              * for a bitmap cache
              */
             @Override
-            protected int sizeOf(String key, SoftReference<Bitmap> bitmapRef) {
-                return BitmapCommonUtils.getBitmapSize(bitmapRef.get());
+            protected int sizeOf(MemoryCacheKey key, Bitmap bitmap) {
+                if (bitmap == null) return 0;
+                return bitmap.getRowBytes() * bitmap.getHeight();
             }
         };
     }
@@ -88,18 +93,17 @@ public class BitmapCache {
         synchronized (mDiskCacheLock) {
             if (mDiskLruCache == null || mDiskLruCache.isClosed()) {
                 File diskCacheDir = new File(globalConfig.getDiskCachePath());
-                if (!diskCacheDir.exists()) {
-                    diskCacheDir.mkdirs();
-                }
-                long availableSpace = BitmapCommonUtils.getAvailableSpace(diskCacheDir);
-                long diskCacheSize = globalConfig.getDiskCacheSize();
-                diskCacheSize = availableSpace > diskCacheSize ? diskCacheSize : availableSpace;
-                try {
-                    mDiskLruCache = LruDiskCache.open(diskCacheDir, 1, 1, diskCacheSize);
-                    mDiskLruCache.setDiskCacheFileNameGenerator(globalConfig.getDiskCacheFileNameGenerator());
-                } catch (Throwable e) {
-                    mDiskLruCache = null;
-                    LogUtils.e(e.getMessage(), e);
+                if (diskCacheDir.exists() || diskCacheDir.mkdirs()) {
+                    long availableSpace = OtherUtils.getAvailableSpace(diskCacheDir);
+                    long diskCacheSize = globalConfig.getDiskCacheSize();
+                    diskCacheSize = availableSpace > diskCacheSize ? diskCacheSize : availableSpace;
+                    try {
+                        mDiskLruCache = LruDiskCache.open(diskCacheDir, 1, 1, diskCacheSize);
+                        mDiskLruCache.setFileNameGenerator(globalConfig.getFileNameGenerator());
+                    } catch (Throwable e) {
+                        mDiskLruCache = null;
+                        LogUtils.e(e.getMessage(), e);
+                    }
                 }
             }
             isDiskCacheReadied = true;
@@ -119,13 +123,13 @@ public class BitmapCache {
         }
     }
 
-    public void setDiskCacheFileNameGenerator(LruDiskCache.DiskCacheFileNameGenerator diskCacheFileNameGenerator) {
-        if (mDiskLruCache != null && diskCacheFileNameGenerator != null) {
-            mDiskLruCache.setDiskCacheFileNameGenerator(diskCacheFileNameGenerator);
+    public void setDiskCacheFileNameGenerator(FileNameGenerator fileNameGenerator) {
+        if (mDiskLruCache != null && fileNameGenerator != null) {
+            mDiskLruCache.setFileNameGenerator(fileNameGenerator);
         }
     }
 
-    public Bitmap downloadBitmap(String uri, BitmapDisplayConfig config) {
+    public Bitmap downloadBitmap(String uri, BitmapDisplayConfig config, final BitmapUtils.BitmapLoadTask<?> task) {
 
         BitmapMeta bitmapMeta = new BitmapMeta();
 
@@ -133,8 +137,8 @@ public class BitmapCache {
         LruDiskCache.Snapshot snapshot = null;
 
         try {
-
-            // download to disk
+            Bitmap bitmap = null;
+            // try download to disk
             if (globalConfig.isDiskCacheEnabled()) {
                 synchronized (mDiskCacheLock) {
                     // Wait for disk cache to initialize
@@ -144,14 +148,16 @@ public class BitmapCache {
                         } catch (Throwable e) {
                         }
                     }
+                }
 
-                    if (mDiskLruCache != null) {
+                if (mDiskLruCache != null) {
+                    try {
                         snapshot = mDiskLruCache.get(uri);
                         if (snapshot == null) {
                             LruDiskCache.Editor editor = mDiskLruCache.edit(uri);
                             if (editor != null) {
                                 outputStream = editor.newOutputStream(DISK_CACHE_INDEX);
-                                bitmapMeta.expiryTimestamp = globalConfig.getDownloader().downloadToStream(uri, outputStream);
+                                bitmapMeta.expiryTimestamp = globalConfig.getDownloader().downloadToStream(uri, outputStream, task);
                                 if (bitmapMeta.expiryTimestamp < 0) {
                                     editor.abort();
                                     return null;
@@ -164,25 +170,38 @@ public class BitmapCache {
                         }
                         if (snapshot != null) {
                             bitmapMeta.inputStream = snapshot.getInputStream(DISK_CACHE_INDEX);
+                            bitmap = decodeBitmapMeta(bitmapMeta, config);
+                            if (bitmap == null) {
+                                bitmapMeta.inputStream = null;
+                                mDiskLruCache.remove(uri);
+                            }
                         }
+                    } catch (Throwable e) {
+                        LogUtils.e(e.getMessage(), e);
                     }
                 }
             }
 
-            // download to memory stream
-            if (!globalConfig.isDiskCacheEnabled() || mDiskLruCache == null || bitmapMeta.inputStream == null) {
+            // try download to memory stream
+            if (bitmap == null) {
                 outputStream = new ByteArrayOutputStream();
-                bitmapMeta.expiryTimestamp = globalConfig.getDownloader().downloadToStream(uri, outputStream);
+                bitmapMeta.expiryTimestamp = globalConfig.getDownloader().downloadToStream(uri, outputStream, task);
                 if (bitmapMeta.expiryTimestamp < 0) {
                     return null;
                 } else {
                     bitmapMeta.data = ((ByteArrayOutputStream) outputStream).toByteArray();
+                    bitmap = decodeBitmapMeta(bitmapMeta, config);
                 }
             }
 
-            Bitmap bitmap = decodeBitmapMeta(bitmapMeta, config);
-
-            return addBitmapToMemoryCache(bitmap, uri, config, bitmapMeta.expiryTimestamp);
+            if (bitmap != null) {
+                bitmap = rotateBitmapIfNeeded(uri, config, bitmap);
+                if (config != null && config.getImageFactory() != null) {
+                    bitmap = config.getImageFactory().createBitmap(bitmap);
+                }
+                addBitmapToMemoryCache(uri, config, bitmap, bitmapMeta.expiryTimestamp);
+            }
+            return bitmap;
         } catch (Throwable e) {
             LogUtils.e(e.getMessage(), e);
         } finally {
@@ -193,12 +212,11 @@ public class BitmapCache {
         return null;
     }
 
-    private Bitmap addBitmapToMemoryCache(Bitmap bitmap, String uri, BitmapDisplayConfig config, long expiryTimestamp) throws IOException {
+    private void addBitmapToMemoryCache(String uri, BitmapDisplayConfig config, Bitmap bitmap, long expiryTimestamp) throws IOException {
         if (uri != null && bitmap != null && globalConfig.isMemoryCacheEnabled() && mMemoryCache != null) {
-            String key = uri + (config == null ? "" : config.toString());
-            mMemoryCache.put(key, new SoftReference<Bitmap>(bitmap), expiryTimestamp);
+            MemoryCacheKey key = new MemoryCacheKey(uri, config);
+            mMemoryCache.put(key, bitmap, expiryTimestamp);
         }
-        return bitmap;
     }
 
     /**
@@ -209,10 +227,9 @@ public class BitmapCache {
      * @return The bitmap if found in cache, null otherwise
      */
     public Bitmap getBitmapFromMemCache(String uri, BitmapDisplayConfig config) {
-        String key = uri + (config == null ? "" : config.toString());
-        if (mMemoryCache != null) {
-            SoftReference<Bitmap> softRef = mMemoryCache.get(key);
-            return softRef == null ? null : softRef.get();
+        if (mMemoryCache != null && globalConfig.isMemoryCacheEnabled()) {
+            MemoryCacheKey key = new MemoryCacheKey(uri, config);
+            return mMemoryCache.get(key);
         }
         return null;
     }
@@ -246,33 +263,34 @@ public class BitmapCache {
                 } catch (Throwable e) {
                 }
             }
-            if (mDiskLruCache != null) {
-                LruDiskCache.Snapshot snapshot = null;
-                try {
-                    snapshot = mDiskLruCache.get(uri);
-                    if (snapshot != null) {
-                        Bitmap bitmap = null;
-                        if (config == null || config.isShowOriginal()) {
-                            bitmap = BitmapDecoder.decodeFileDescriptor(
-                                    snapshot.getInputStream(DISK_CACHE_INDEX).getFD());
-                        } else {
-                            bitmap = BitmapDecoder.decodeSampledBitmapFromDescriptor(
-                                    snapshot.getInputStream(DISK_CACHE_INDEX).getFD(),
-                                    config.getBitmapMaxWidth(),
-                                    config.getBitmapMaxHeight(),
-                                    config.getBitmapConfig());
-                        }
-
-                        return addBitmapToMemoryCache(bitmap, uri, config, mDiskLruCache.getExpiryTimestamp(uri));
-                    }
-                } catch (Throwable e) {
-                    LogUtils.e(e.getMessage(), e);
-                } finally {
-                    IOUtils.closeQuietly(snapshot);
-                }
-            }
-            return null;
         }
+        if (mDiskLruCache != null) {
+            LruDiskCache.Snapshot snapshot = null;
+            try {
+                snapshot = mDiskLruCache.get(uri);
+                if (snapshot != null) {
+                    Bitmap bitmap = null;
+                    if (config == null || config.isShowOriginal()) {
+                        bitmap = BitmapDecoder.decodeFileDescriptor(
+                                snapshot.getInputStream(DISK_CACHE_INDEX).getFD());
+                    } else {
+                        bitmap = BitmapDecoder.decodeSampledBitmapFromDescriptor(
+                                snapshot.getInputStream(DISK_CACHE_INDEX).getFD(),
+                                config.getBitmapMaxSize(),
+                                config.getBitmapConfig());
+                    }
+
+                    bitmap = rotateBitmapIfNeeded(uri, config, bitmap);
+                    addBitmapToMemoryCache(uri, config, bitmap, mDiskLruCache.getExpiryTimestamp(uri));
+                    return bitmap;
+                }
+            } catch (Throwable e) {
+                LogUtils.e(e.getMessage(), e);
+            } finally {
+                IOUtils.closeQuietly(snapshot);
+            }
+        }
+        return null;
     }
 
     /**
@@ -306,15 +324,17 @@ public class BitmapCache {
     }
 
 
-    public void clearCache(String uri, BitmapDisplayConfig config) {
-        clearMemoryCache(uri, config);
+    public void clearCache(String uri) {
+        clearMemoryCache(uri);
         clearDiskCache(uri);
     }
 
-    public void clearMemoryCache(String uri, BitmapDisplayConfig config) {
-        String key = uri + (config == null ? "" : config.toString());
+    public void clearMemoryCache(String uri) {
+        MemoryCacheKey key = new MemoryCacheKey(uri, null);
         if (mMemoryCache != null) {
-            mMemoryCache.remove(key);
+            while (mMemoryCache.containsKey(key)) {
+                mMemoryCache.remove(key);
+            }
         }
     }
 
@@ -380,8 +400,7 @@ public class BitmapCache {
             } else {
                 bitmap = BitmapDecoder.decodeSampledBitmapFromDescriptor(
                         bitmapMeta.inputStream.getFD(),
-                        config.getBitmapMaxWidth(),
-                        config.getBitmapMaxHeight(),
+                        config.getBitmapMaxSize(),
                         config.getBitmapConfig());
             }
         } else if (bitmapMeta.data != null) {
@@ -390,11 +409,80 @@ public class BitmapCache {
             } else {
                 bitmap = BitmapDecoder.decodeSampledBitmapFromByteArray(
                         bitmapMeta.data,
-                        config.getBitmapMaxWidth(),
-                        config.getBitmapMaxHeight(),
+                        config.getBitmapMaxSize(),
                         config.getBitmapConfig());
             }
         }
         return bitmap;
+    }
+
+    private Bitmap rotateBitmapIfNeeded(String uri, BitmapDisplayConfig config, Bitmap bitmap) {
+        Bitmap result = bitmap;
+        if (config != null && config.isAutoRotation()) {
+            File bitmapFile = this.getBitmapFileFromDiskCache(uri);
+            if (bitmapFile != null && bitmapFile.exists()) {
+                ExifInterface exif = null;
+                try {
+                    exif = new ExifInterface(bitmapFile.getPath());
+                } catch (Throwable e) {
+                    return result;
+                }
+                int orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED);
+                int angle = 0;
+                switch (orientation) {
+                    case ExifInterface.ORIENTATION_ROTATE_90:
+                        angle = 90;
+                        break;
+                    case ExifInterface.ORIENTATION_ROTATE_180:
+                        angle = 180;
+                        break;
+                    case ExifInterface.ORIENTATION_ROTATE_270:
+                        angle = 270;
+                        break;
+                    default:
+                        angle = 0;
+                        break;
+                }
+                if (angle != 0) {
+                    Matrix m = new Matrix();
+                    m.postRotate(angle);
+                    result = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), m, true);
+                    bitmap.recycle();
+                    bitmap = null;
+                }
+            }
+        }
+        return result;
+    }
+
+    public class MemoryCacheKey {
+        private String uri;
+        private String subKey;
+
+        private MemoryCacheKey(String uri, BitmapDisplayConfig config) {
+            this.uri = uri;
+            this.subKey = config == null ? null : config.toString();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof MemoryCacheKey)) return false;
+
+            MemoryCacheKey that = (MemoryCacheKey) o;
+
+            if (!uri.equals(that.uri)) return false;
+
+            if (subKey != null && that.subKey != null) {
+                return subKey.equals(that.subKey);
+            }
+
+            return true;
+        }
+
+        @Override
+        public int hashCode() {
+            return uri.hashCode();
+        }
     }
 }
